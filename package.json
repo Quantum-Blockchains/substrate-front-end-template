@@ -34,6 +34,8 @@
     "@polkadot/ui-settings": "^3.3.1",
     "@polkadot/util": "^12.1.2",
     "@polkadot/util-crypto": "^12.1.2",
+    "base58": "^2.0.1",
+    "ed25519": "^0.0.5",
     "node-polyfill-webpack-plugin": "^1.1.4",
     "prop-types": "^15.8.1",
     "react": "^17.0.2",
@@ -42,7 +44,8 @@
     "react-scripts": "^5.0.0",
     "semantic-ui-css": "Semantic-Org/Semantic-UI-CSS#master",
     "semantic-ui-react": "^2.1.2",
-    "stream-browserify": "^3.0.0"
+    "stream-browserify": "^3.0.0",
+    "three": "^0.165.0"
   },
   "devDependencies": {
     "eslint": "^8.10.0",
