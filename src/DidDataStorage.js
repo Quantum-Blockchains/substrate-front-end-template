@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import {
   Button,
   Card,
@@ -16,11 +16,9 @@ import {
 import {
   base58Decode,
   base58Encode,
-  cryptoWaitReady,
-  mnemonicGenerate,
+  blake2AsU8a,
 } from '@polkadot/util-crypto'
 import { web3Enable, web3FromSource } from '@polkadot/extension-dapp'
-import { Keyring } from '@polkadot/keyring'
 import {
   hexToU8a,
   isHex,
@@ -93,6 +91,13 @@ const buildDidDocument = (didValue, chainData) => {
     }
   })
 
+  const normalizedMetadata = Array.isArray(chainData.metadata)
+    ? chainData.metadata.map(entry => ({
+        key: bytesToString(entry.key),
+        value: bytesToString(entry.value),
+      }))
+    : []
+
   return {
     '@context': ['https://www.w3.org/ns/did/v1'],
     id: didValue,
@@ -105,11 +110,11 @@ const buildDidDocument = (didValue, chainData) => {
     capabilityInvocation,
     capabilityDelegation,
     service: normalizedServices,
-    metadata: chainData.metadata || [],
+    metadata: normalizedMetadata,
   }
 }
 
-const FEATURE_TABS = ['DID details', 'Create DID', 'DID update', 'Schema']
+const FEATURE_TABS = ['DID details', 'DID update', 'Schema']
 const ROLE_OPTIONS = [
   { key: 'Authentication', text: 'Authentication', value: 'Authentication' },
   {
@@ -138,15 +143,8 @@ export default function DidDataStorage() {
   const [didDetailsDocument, setDidDetailsDocument] = useState(null)
   const [isResolvingDid, setIsResolvingDid] = useState(false)
   const [didUpdateInput, setDidUpdateInput] = useState('')
-  const [createDidSeed, setCreateDidSeed] = useState('')
-  const [createDidPublicKey, setCreateDidPublicKey] = useState(null)
-  const [createDidSignature, setCreateDidSignature] = useState(null)
-  const [isGeneratingDid, setIsGeneratingDid] = useState(false)
   const [addKeyPublicKey, setAddKeyPublicKey] = useState('')
   const [addKeyRoles, setAddKeyRoles] = useState([])
-  const [rotateOldPublicKey, setRotateOldPublicKey] = useState('')
-  const [rotateNewPublicKey, setRotateNewPublicKey] = useState('')
-  const [rotateKeyRoles, setRotateKeyRoles] = useState([])
   const [updateRolesPublicKey, setUpdateRolesPublicKey] = useState('')
   const [updateRolesValues, setUpdateRolesValues] = useState([])
   const [serviceIdInput, setServiceIdInput] = useState('')
@@ -165,6 +163,65 @@ export default function DidDataStorage() {
   const [didUpdateChainData, setDidUpdateChainData] = useState(null)
   const [didUpdateLoadError, setDidUpdateLoadError] = useState('')
   const [isLoadingDidUpdate, setIsLoadingDidUpdate] = useState(false)
+  const [schemaDidInput, setSchemaDidInput] = useState('')
+  const [schemaUrlInput, setSchemaUrlInput] = useState('')
+  const [schemaJsonInput, setSchemaJsonInput] = useState('')
+  const [schemaJsonError, setSchemaJsonError] = useState('')
+  const [schemaIdValue, setSchemaIdValue] = useState('')
+  const [isCreatingSchema, setIsCreatingSchema] = useState(false)
+  const [toasts, setToasts] = useState([])
+
+  const addToast = useCallback((type, content) => {
+    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    setToasts(prev => [...prev, { id, type, content }])
+    setTimeout(() => {
+      setToasts(prev => prev.filter(toast => toast.id !== id))
+    }, 4500)
+  }, [])
+
+  useEffect(() => {
+    if (didDetailsError) {
+      addToast('error', didDetailsError)
+      setDidDetailsError('')
+    }
+  }, [addToast, didDetailsError])
+
+  useEffect(() => {
+    if (!didDetailsStatus || didDetailsStatus === 'Resolving DID...') {
+      return
+    }
+    addToast('info', didDetailsStatus)
+    setDidDetailsStatus('')
+  }, [addToast, didDetailsStatus])
+
+  useEffect(() => {
+    if (didUpdateError) {
+      addToast('error', didUpdateError)
+      setDidUpdateError('')
+    }
+  }, [addToast, didUpdateError])
+
+  useEffect(() => {
+    if (!didUpdateStatus) {
+      return
+    }
+    addToast('info', didUpdateStatus)
+    setDidUpdateStatus('')
+  }, [addToast, didUpdateStatus])
+
+  useEffect(() => {
+    if (didOptionsError) {
+      addToast('error', didOptionsError)
+      setDidOptionsError('')
+    }
+  }, [addToast, didOptionsError])
+
+  useEffect(() => {
+    if (didUpdateLoadError) {
+      addToast('error', didUpdateLoadError)
+      setDidUpdateLoadError('')
+    }
+  }, [addToast, didUpdateLoadError])
 
   const normalizeDidInput = rawValue => {
     const value = rawValue.trim()
@@ -306,6 +363,12 @@ export default function DidDataStorage() {
     try {
       const response = await provider.send('did_getByString', [normalized.did])
       const rpcResult = response?.result ?? response
+      if (!rpcResult) {
+        setDidDetailsDocument(null)
+        setDidDetailsStatus('')
+        setDidDetailsError('DID not found.')
+        return
+      }
       setDidDetailsDocument(buildDidDocument(normalized.did, rpcResult))
       setDidDetailsStatus('DID resolved successfully.')
     } catch (error) {
@@ -320,81 +383,62 @@ export default function DidDataStorage() {
     <Card fluid style={{ marginTop: '1.5em' }}>
       <Card.Content>
         <Card.Header>DID details</Card.Header>
-        <Card.Meta>Resolve DID metadata via did_getByString RPC method.</Card.Meta>
+        <Card.Meta>Resolve DID via did_getByString RPC method.</Card.Meta>
       </Card.Content>
       <Card.Content>
         <Form>
-          <Form.Field error={Boolean(didDetailsError)}>
-            <label>Enter DID</label>
-            <Dropdown
-              fluid
-              selection
-              search
-              allowAdditions
-              placeholder="Type or select a DID"
-              options={didOptions}
-              loading={isLoadingDids}
-              value={didDetailsInput}
-              onAddItem={(_, { value }) => {
-                const newValue = String(value || '').trim()
-                if (!newValue) {
-                  return
-                }
-                setDidOptions(prev => {
-                  if (prev.some(option => option.value === newValue)) {
-                    return prev
+          <Form.Group widths="equal">
+            <Form.Field error={Boolean(didDetailsError)} width={14}>
+              <label>Enter DID</label>
+              <Dropdown
+                fluid
+                selection
+                search
+                allowAdditions
+                placeholder="DID"
+                options={didOptions}
+                loading={isLoadingDids}
+                value={didDetailsInput}
+                onAddItem={(_, { value }) => {
+                  const newValue = String(value || '').trim()
+                  if (!newValue) {
+                    return
                   }
-                  return [
-                    ...prev,
-                    { key: newValue, value: newValue, text: newValue },
-                  ]
-                })
-              }}
-              onChange={(_, changed) => {
-                setDidDetailsInput(changed.value)
-                if (didDetailsError) {
-                  setDidDetailsError('')
-                }
-                if (didDetailsStatus) {
-                  setDidDetailsStatus('')
-                }
-              }}
-            />
-          </Form.Field>
-          <Button
-            primary
-            type="button"
-            onClick={resolveDidDetails}
-            loading={isResolvingDid}
-            disabled={isResolvingDid}
-          >
-            Resolve
-          </Button>
+                  setDidOptions(prev => {
+                    if (prev.some(option => option.value === newValue)) {
+                      return prev
+                    }
+                    return [
+                      ...prev,
+                      { key: newValue, value: newValue, text: newValue },
+                    ]
+                  })
+                }}
+                onChange={(_, changed) => {
+                  setDidDetailsInput(changed.value)
+                  if (didDetailsError) {
+                    setDidDetailsError('')
+                  }
+                  if (didDetailsStatus) {
+                    setDidDetailsStatus('')
+                  }
+                }}
+              />
+            </Form.Field>
+            <Form.Field width={2} style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end' }}>
+              <Button
+                primary
+                type="button"
+                onClick={resolveDidDetails}
+                loading={isResolvingDid}
+                disabled={isResolvingDid}
+                style={{ width: '140px' }}
+              >
+                Resolve
+              </Button>
+            </Form.Field>
+          </Form.Group>
         </Form>
-        {didOptionsError && (
-          <Message
-            info
-            size="small"
-            style={{ marginTop: '.5em' }}
-            content={didOptionsError}
-          />
-        )}
-        {didDetailsError && (
-          <Message
-            negative
-            size="small"
-            style={{ marginTop: '.5em' }}
-            content={didDetailsError}
-          />
-        )}
-        {didDetailsStatus && (
-          <Message
-            info
-            size="small"
-            style={{ marginTop: didDetailsError ? '.5em' : '.75em' }}
-            content={didDetailsStatus}
-          />
-        )}
         {didDetailsDocument && (
           <Segment
             style={{
@@ -408,9 +452,12 @@ export default function DidDataStorage() {
                 margin: 0,
                 whiteSpace: 'pre-wrap',
                 wordBreak: 'break-word',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+              }}
+              dangerouslySetInnerHTML={{
+                __html: jsonSyntaxHighlight(didDetailsDocument),
               }}
             >
-              {JSON.stringify(didDetailsDocument, null, 2)}
             </pre>
           </Segment>
         )}
@@ -438,6 +485,32 @@ export default function DidDataStorage() {
     return stringToHex(trimmed)
   }
 
+  const jsonSyntaxHighlight = value => {
+    const json = JSON.stringify(value, null, 2)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+
+    return json.replace(
+      /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(?:\\s*:)?|\\b(true|false|null)\\b|-?\\d+(?:\\.\\d+)?(?:[eE][+\\-]?\\d+)?)/g,
+      match => {
+        let color = '#6b7280'
+        if (match.startsWith('"') && match.endsWith(':')) {
+          color = '#e06c75'
+        } else if (match.startsWith('"')) {
+          color = '#98c379'
+        } else if (match === 'true' || match === 'false') {
+          color = '#56b6c2'
+        } else if (match === 'null') {
+          color = '#c678dd'
+        } else {
+          color = '#d19a66'
+        }
+        return `<span style="color:${color}">${match}</span>`
+      }
+    )
+  }
+
   const getFromAccount = async () => {
     if (!currentAccount) {
       return null
@@ -454,28 +527,6 @@ export default function DidDataStorage() {
 
     const injector = await web3FromSource(source)
     return [address, { signer: injector.signer }]
-  }
-
-  const generateDidKeypair = async () => {
-    clearDidUpdateMessages()
-    setIsGeneratingDid(true)
-
-    try {
-      await cryptoWaitReady()
-      const seed = mnemonicGenerate()
-      const keyring = new Keyring({ type: 'mldsa44' })
-      const pair = keyring.addFromUri(seed, {}, 'mldsa44')
-      const payload = u8aConcat(stringToU8a('QSB_DID_CREATE'), pair.publicKey)
-      const signature = pair.sign(payload)
-
-      setCreateDidSeed(seed)
-      setCreateDidPublicKey(pair.publicKey)
-      setCreateDidSignature(signature)
-    } catch (error) {
-      setDidUpdateError(`Failed to generate keypair: ${error.message}`)
-    } finally {
-      setIsGeneratingDid(false)
-    }
   }
 
   const loadDidsFromExtension = async () => {
@@ -532,7 +583,7 @@ export default function DidDataStorage() {
     }
   }, [activeFeature])
 
-  useEffect(() => {
+  const loadDidUpdateDetails = useCallback(async () => {
     if (activeFeature !== 'DID update') {
       return
     }
@@ -543,40 +594,46 @@ export default function DidDataStorage() {
       return
     }
 
+    const provider = api?._rpcCore?.provider
+    if (!provider) {
+      setDidUpdateLoadError('RPC provider is not ready yet.')
+      setDidUpdateChainData(null)
+      return
+    }
+
+    const normalized = normalizeDidInput(didUpdateInput)
+    if (normalized.error) {
+      setDidUpdateLoadError(normalized.error)
+      setDidUpdateChainData(null)
+      return
+    }
+
+    setIsLoadingDidUpdate(true)
+    setDidUpdateLoadError('')
+
+    try {
+      const response = await provider.send('did_getByString', [normalized.did])
+      const rpcResult = response?.result ?? response
+      setDidUpdateChainData(rpcResult)
+    } catch (error) {
+      setDidUpdateChainData(null)
+      setDidUpdateLoadError(`Failed to load DID data: ${error.message}`)
+    } finally {
+      setIsLoadingDidUpdate(false)
+    }
+  }, [activeFeature, api, didUpdateInput])
+
+  useEffect(() => {
+    if (activeFeature !== 'DID update') {
+      return
+    }
+
     const timeout = setTimeout(() => {
-      ;(async () => {
-        const provider = api?._rpcCore?.provider
-        if (!provider) {
-          setDidUpdateLoadError('RPC provider is not ready yet.')
-          setDidUpdateChainData(null)
-          return
-        }
-
-        const normalized = normalizeDidInput(didUpdateInput)
-        if (normalized.error) {
-          setDidUpdateLoadError(normalized.error)
-          setDidUpdateChainData(null)
-          return
-        }
-
-        setIsLoadingDidUpdate(true)
-        setDidUpdateLoadError('')
-
-        try {
-          const response = await provider.send('did_getByString', [normalized.did])
-          const rpcResult = response?.result ?? response
-          setDidUpdateChainData(rpcResult)
-        } catch (error) {
-          setDidUpdateChainData(null)
-          setDidUpdateLoadError(`Failed to load DID data: ${error.message}`)
-        } finally {
-          setIsLoadingDidUpdate(false)
-        }
-      })()
+      loadDidUpdateDetails()
     }, 300)
 
     return () => clearTimeout(timeout)
-  }, [activeFeature, didUpdateInput, api])
+  }, [activeFeature, didUpdateInput, loadDidUpdateDetails])
 
   const ensureApiReady = () => {
     if (!api) {
@@ -599,7 +656,32 @@ export default function DidDataStorage() {
     return normalized.did
   }
 
-  const submitTx = async (tx, statusLabel) => {
+  const requestDidPassword = async (did, payload) => {
+    const extensions = await web3Enable(config.APP_NAME)
+    const extension = extensions.find(item => item?.dids?.sign)
+
+    if (!extension?.dids?.sign) {
+      throw new Error('Extension does not support DID signing.')
+    }
+
+    await extension.dids.sign({ did, payload })
+  }
+
+  const wrapSignerWithDid = (signer, did) => {
+    if (!did || !signer?.signPayload) {
+      return signer
+    }
+
+    return {
+      ...signer,
+      signPayload: async payload => {
+        await requestDidPassword(did, payload)
+        return signer.signPayload(payload)
+      },
+    }
+  }
+
+  const submitTx = async (tx, statusLabel, didForSignature) => {
     const fromAccount = await getFromAccount()
     if (!fromAccount) {
       setDidUpdateError('Unable to sign the transaction.')
@@ -611,36 +693,77 @@ export default function DidDataStorage() {
     setIsUpdatingDid(true)
 
     try {
-      await tx.signAndSend(...fromAccount, result => {
-        if (result.dispatchError) {
-          if (result.dispatchError.isModule) {
-            const decoded = api.registry.findMetaError(
-              result.dispatchError.asModule
+      const [addressOrPair, options] = fromAccount
+      const hasInjectedSigner = Boolean(options?.signer)
+      const signer = hasInjectedSigner
+        ? wrapSignerWithDid(options.signer, didForSignature)
+        : undefined
+
+      const signPromise = hasInjectedSigner
+        ? tx.signAndSend(addressOrPair, { ...options, signer }, result => {
+          if (result.dispatchError) {
+            if (result.dispatchError.isModule) {
+              const decoded = api.registry.findMetaError(
+                result.dispatchError.asModule
+              )
+              setDidUpdateError(
+                `Transaction failed: ${decoded.section}.${decoded.name}`
+              )
+            } else {
+              setDidUpdateError(
+                `Transaction failed: ${result.dispatchError.toString()}`
+              )
+            }
+            setDidUpdateStatus('')
+            setIsUpdatingDid(false)
+            return
+          }
+
+          if (result.status.isFinalized) {
+            setDidUpdateStatus(
+              `Transaction finalized. Block: ${result.status.asFinalized.toString()}`
             )
-            setDidUpdateError(
-              `Transaction failed: ${decoded.section}.${decoded.name}`
-            )
+            setIsUpdatingDid(false)
+            loadDidUpdateDetails()
           } else {
-            setDidUpdateError(
-              `Transaction failed: ${result.dispatchError.toString()}`
+            setDidUpdateStatus(
+              `Current transaction status: ${result.status.type}`
             )
           }
-          setDidUpdateStatus('')
-          setIsUpdatingDid(false)
-          return
-        }
+        })
+        : tx.signAndSend(...fromAccount, result => {
+          if (result.dispatchError) {
+            if (result.dispatchError.isModule) {
+              const decoded = api.registry.findMetaError(
+                result.dispatchError.asModule
+              )
+              setDidUpdateError(
+                `Transaction failed: ${decoded.section}.${decoded.name}`
+              )
+            } else {
+              setDidUpdateError(
+                `Transaction failed: ${result.dispatchError.toString()}`
+              )
+            }
+            setDidUpdateStatus('')
+            setIsUpdatingDid(false)
+            return
+          }
 
-        if (result.status.isFinalized) {
-          setDidUpdateStatus(
-            `Transaction finalized. Block: ${result.status.asFinalized.toString()}`
-          )
-          setIsUpdatingDid(false)
-        } else {
-          setDidUpdateStatus(
-            `Current transaction status: ${result.status.type}`
-          )
-        }
-      })
+          if (result.status.isFinalized) {
+            setDidUpdateStatus(
+              `Transaction finalized. Block: ${result.status.asFinalized.toString()}`
+            )
+            setIsUpdatingDid(false)
+            loadDidUpdateDetails()
+          } else {
+            setDidUpdateStatus(
+              `Current transaction status: ${result.status.type}`
+            )
+          }
+        })
+
+      await signPromise
     } catch (error) {
       setDidUpdateStatus('')
       setDidUpdateError(`Failed to submit: ${error.message}`)
@@ -648,19 +771,141 @@ export default function DidDataStorage() {
     }
   }
 
-  const submitCreateDid = async () => {
+  const submitSchemaTx = async (tx, statusLabel, didForSignature) => {
+    const fromAccount = await getFromAccount()
+    if (!fromAccount) {
+      addToast('error', 'Unable to sign the transaction.')
+      return
+    }
+
+    setIsCreatingSchema(true)
+    addToast('info', statusLabel)
+
+    try {
+      const [addressOrPair, options] = fromAccount
+      const hasInjectedSigner = Boolean(options?.signer)
+      const signer = hasInjectedSigner
+        ? wrapSignerWithDid(options.signer, didForSignature)
+        : undefined
+
+      const signPromise = hasInjectedSigner
+        ? tx.signAndSend(addressOrPair, { ...options, signer }, result => {
+          if (result.dispatchError) {
+            if (result.dispatchError.isModule) {
+              const decoded = api.registry.findMetaError(
+                result.dispatchError.asModule
+              )
+              addToast('error', `Transaction failed: ${decoded.section}.${decoded.name}`)
+            } else {
+              addToast('error', `Transaction failed: ${result.dispatchError.toString()}`)
+            }
+            setIsCreatingSchema(false)
+            return
+          }
+
+          if (result.status.isFinalized) {
+            addToast(
+              'info',
+              `Transaction finalized. Block: ${result.status.asFinalized.toString()}`
+            )
+            setIsCreatingSchema(false)
+          }
+        })
+        : tx.signAndSend(...fromAccount, result => {
+          if (result.dispatchError) {
+            if (result.dispatchError.isModule) {
+              const decoded = api.registry.findMetaError(
+                result.dispatchError.asModule
+              )
+              addToast('error', `Transaction failed: ${decoded.section}.${decoded.name}`)
+            } else {
+              addToast('error', `Transaction failed: ${result.dispatchError.toString()}`)
+            }
+            setIsCreatingSchema(false)
+            return
+          }
+
+          if (result.status.isFinalized) {
+            addToast(
+              'info',
+              `Transaction finalized. Block: ${result.status.asFinalized.toString()}`
+            )
+            setIsCreatingSchema(false)
+          }
+        })
+
+      await signPromise
+    } catch (error) {
+      addToast('error', `Failed to submit: ${error.message}`)
+      setIsCreatingSchema(false)
+    }
+  }
+
+  const buildSchemaId = schemaJson => {
+    if (!api?.genesisHash) {
+      return ''
+    }
+    const schemaBytes = stringToU8a(schemaJson)
+    const material = u8aConcat(
+      stringToU8a('QSB_SCHEMA'),
+      api.genesisHash.toU8a(),
+      schemaBytes
+    )
+    const schemaId = blake2AsU8a(material, 256)
+    return `did:qsb:schema:${base58Encode(schemaId)}`
+  }
+
+  const submitCreateSchema = async () => {
     if (!ensureApiReady()) {
       return
     }
 
-    if (!createDidPublicKey || !createDidSignature) {
-      setDidUpdateError('Generate a keypair first.')
+    const didValue = normalizeDidInput(schemaDidInput)
+    if (didValue.error) {
+      addToast('error', didValue.error)
       return
     }
 
-    await submitTx(
-      api.tx.did.createDid(createDidPublicKey, createDidSignature),
-      'Creating DID...'
+    if (!schemaUrlInput.trim()) {
+      addToast('error', 'Enter a schema URL.')
+      return
+    }
+
+    if (!schemaJsonInput.trim()) {
+      addToast('error', 'Enter a JSON schema.')
+      return
+    }
+
+    try {
+      JSON.parse(schemaJsonInput)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid JSON.'
+      setSchemaJsonError(message)
+      addToast('error', `Invalid JSON: ${message}`)
+      return
+    }
+
+    const schemaId = buildSchemaId(schemaJsonInput.trim())
+    setSchemaIdValue(schemaId)
+
+    if (!api?.tx?.schema?.registerSchema) {
+      addToast('error', 'Schema pallet is not available in this runtime.')
+      return
+    }
+
+    const schemaJsonHex = stringToHex(schemaJsonInput.trim())
+    const schemaUrlHex = stringToHex(schemaUrlInput.trim())
+    const issuerDidHex = stringToHex(didValue.did)
+
+    await submitSchemaTx(
+      api.tx.schema.registerSchema(
+        schemaJsonHex,
+        schemaUrlHex,
+        issuerDidHex,
+        new Uint8Array()
+      ),
+      'Registering schema...',
+      didValue.did
     )
   }
 
@@ -687,7 +932,8 @@ export default function DidDataStorage() {
 
     await submitTx(
       api.tx.did.addKey(didValue, publicKey, addKeyRoles),
-      'Adding key...'
+      'Adding key...',
+      didValue
     )
   }
 
@@ -709,7 +955,8 @@ export default function DidDataStorage() {
 
     await submitTx(
       api.tx.did.revokeKey(didValue, publicKey),
-      'Revoking key...'
+      'Revoking key...',
+      didValue
     )
   }
 
@@ -725,7 +972,8 @@ export default function DidDataStorage() {
 
     await submitTx(
       api.tx.did.deactivateDid(didValue),
-      'Deactivating DID...'
+      'Deactivating DID...',
+      didValue
     )
   }
 
@@ -765,7 +1013,8 @@ export default function DidDataStorage() {
 
     await submitTx(
       api.tx.did.addService(didValue, service),
-      'Adding service...'
+      'Adding service...',
+      didValue
     )
   }
 
@@ -787,7 +1036,8 @@ export default function DidDataStorage() {
 
     await submitTx(
       api.tx.did.removeService(didValue, serviceId),
-      'Removing service...'
+      'Removing service...',
+      didValue
     )
   }
 
@@ -820,7 +1070,8 @@ export default function DidDataStorage() {
 
     await submitTx(
       api.tx.did.setMetadata(didValue, entry),
-      'Setting metadata...'
+      'Setting metadata...',
+      didValue
     )
   }
 
@@ -842,45 +1093,8 @@ export default function DidDataStorage() {
 
     await submitTx(
       api.tx.did.removeMetadata(didValue, key),
-      'Removing metadata...'
-    )
-  }
-
-  const submitRotateKey = async () => {
-    if (!ensureApiReady()) {
-      return
-    }
-
-    const didValue = ensureDidValue()
-    if (!didValue) {
-      return
-    }
-
-    const oldPublicKey = toU8aInput(rotateOldPublicKey)
-    if (!oldPublicKey) {
-      setDidUpdateError('Enter the old public key.')
-      return
-    }
-
-    const newPublicKey = toU8aInput(rotateNewPublicKey)
-    if (!newPublicKey) {
-      setDidUpdateError('Enter the new public key.')
-      return
-    }
-
-    if (!rotateKeyRoles.length) {
-      setDidUpdateError('Select at least one role.')
-      return
-    }
-
-    await submitTx(
-      api.tx.did.rotateKey(
-        didValue,
-        oldPublicKey,
-        newPublicKey,
-        rotateKeyRoles
-      ),
-      'Rotating key...'
+      'Removing metadata...',
+      didValue
     )
   }
 
@@ -911,77 +1125,10 @@ export default function DidDataStorage() {
         publicKey,
         updateRolesValues
       ),
-      'Updating roles...'
+      'Updating roles...',
+      didValue
     )
   }
-
-  const renderCreateDidCard = () => (
-    <Card fluid style={{ marginTop: '1.5em' }}>
-      <Card.Content>
-        <Card.Header>Create DID</Card.Header>
-        <Card.Meta>Create a new DID from a public key.</Card.Meta>
-      </Card.Content>
-      <Card.Content>
-        <Form>
-          <Form.Field>
-            <label>Generate ML-DSA-44 keypair</label>
-            <Button
-              primary
-              type="button"
-              onClick={generateDidKeypair}
-              loading={isGeneratingDid}
-              disabled={isGeneratingDid}
-            >
-              Generate keypair
-            </Button>
-          </Form.Field>
-          <Form.Field>
-            <label>Seed phrase (save it)</label>
-            <Input
-              fluid
-              readOnly
-              value={createDidSeed}
-              placeholder="Generate a keypair to see the seed phrase"
-            />
-          </Form.Field>
-          <Form.Field>
-            <label>Public key (hex)</label>
-            <Input
-              fluid
-              readOnly
-              value={createDidPublicKey ? u8aToHex(createDidPublicKey) : ''}
-              placeholder="Generate a keypair to see the public key"
-            />
-          </Form.Field>
-          <Button
-            primary
-            type="button"
-            onClick={submitCreateDid}
-            loading={isUpdatingDid}
-            disabled={isUpdatingDid || !createDidPublicKey}
-          >
-            Create DID
-          </Button>
-        </Form>
-        {didUpdateError && (
-          <Message
-            negative
-            size="small"
-            style={{ marginTop: '.5em' }}
-            content={didUpdateError}
-          />
-        )}
-        {didUpdateStatus && (
-          <Message
-            info
-            size="small"
-            style={{ marginTop: didUpdateError ? '.5em' : '.75em' }}
-            content={didUpdateStatus}
-          />
-        )}
-      </Card.Content>
-    </Card>
-  )
 
   const renderDidUpdateCard = () => {
     const keys = Array.isArray(didUpdateChainData?.keys)
@@ -1009,7 +1156,7 @@ export default function DidDataStorage() {
               selection
               search
               allowAdditions
-              placeholder="Type or select a DID"
+              placeholder="DID"
               options={didOptions}
               loading={isLoadingDids}
               value={didUpdateInput}
@@ -1034,28 +1181,6 @@ export default function DidDataStorage() {
               }}
             />
           </Form.Field>
-          {didUpdateInput.trim() && (
-            <Message
-              size="small"
-              info
-              style={{ marginTop: '.5em' }}
-              content={() => {
-                const normalized = normalizeDidInput(didUpdateInput)
-                if (normalized.error) {
-                  return `Normalized DID error: ${normalized.error}`
-                }
-                return `Normalized DID: ${normalized.did} | id: ${normalized.didId} (len ${normalized.didIdLength}) | id hex: ${normalized.didIdHex}`
-              }}
-            />
-          )}
-          {didOptionsError && (
-            <Message
-              info
-              size="small"
-              style={{ marginTop: '.5em' }}
-              content={didOptionsError}
-            />
-          )}
         </Form>
         <Form>
           <Form.Field>
@@ -1067,7 +1192,6 @@ export default function DidDataStorage() {
                 { key: 'keys', text: 'Keys', value: 'Keys' },
                 { key: 'services', text: 'Services', value: 'Services' },
                 { key: 'metadata', text: 'Metadata', value: 'Metadata' },
-                { key: 'rotate-key', text: 'Rotate key', value: 'Rotate key' },
                 { key: 'deactivate', text: 'Deactivate DID', value: 'Deactivate DID' },
               ]}
               value={didUpdateSection}
@@ -1081,14 +1205,6 @@ export default function DidDataStorage() {
             size="small"
             style={{ marginTop: '.5em' }}
             content="Loading DID data..."
-          />
-        )}
-        {didUpdateLoadError && (
-          <Message
-            negative
-            size="small"
-            style={{ marginTop: '.5em' }}
-            content={didUpdateLoadError}
           />
         )}
         {didUpdateSection === 'Keys' && (
@@ -1229,85 +1345,111 @@ export default function DidDataStorage() {
         )}
         {didUpdateSection === 'Services' && (
           <Segment>
-            <Header as="h4">Existing service</Header>
+            <Header as="h4">Existing Services</Header>
             {services.length === 0 ? (
               <Message size="small" info content="No services found for this DID." />
             ) : (
-              services.map((service, index) => {
-                const serviceIdHex = formatBytesHex(service.id)
-                const serviceIdText = formatBytesText(service.id)
-                const serviceTypeText = formatBytesText(service.service_type)
-                const endpointText = formatBytesText(service.endpoint)
-                const normalizedDid = normalizeDidInput(didUpdateInput)
-                const ownerDid = normalizedDid?.did || didUpdateInput.trim()
-                const serviceName = serviceIdText || serviceIdHex || '—'
+              <div
+                style={{
+                  display: 'grid',
+                  gap: '1em',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  alignItems: 'stretch',
+                  gridAutoRows: '1fr',
+                }}
+              >
+                {services.map((service, index) => {
+                  const serviceIdHex = formatBytesHex(service.id)
+                  const serviceIdText = formatBytesText(service.id)
+                  const serviceTypeText = formatBytesText(service.service_type)
+                  const endpointText = formatBytesText(service.endpoint)
+                  const normalizedDid = normalizeDidInput(didUpdateInput)
+                  const ownerDid = normalizedDid?.did || didUpdateInput.trim()
+                  const serviceName = serviceIdText || serviceIdHex || '—'
 
-                return (
-                  <Segment key={`${serviceIdHex}-${index}`}>
-                    <Header as="h5">Service {index + 1}</Header>
-                    <div style={{ wordBreak: 'break-word' }}>
-                      <strong>Name:</strong> {ownerDid}#{serviceName}
-                    </div>
-                    <div style={{ wordBreak: 'break-word' }}>
-                      <strong>Type:</strong> {serviceTypeText || '—'}
-                    </div>
-                    <div style={{ wordBreak: 'break-word' }}>
-                      <strong>Endpoint:</strong> {endpointText || '—'}
-                    </div>
-                    <Button
-                      negative
-                      type="button"
-                      onClick={() => submitRemoveServiceValue(serviceIdHex)}
-                      loading={isUpdatingDid}
-                      disabled={isUpdatingDid}
-                      style={{ marginTop: '.5em' }}
+                  return (
+                    <Segment
+                      key={`${serviceIdHex}-${index}`}
+                      style={{
+                        boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        height: '100%',
+                        minHeight: '180px',
+                        margin: 0,
+                      }}
                     >
-                      Remove
-                    </Button>
-                  </Segment>
-                )
-              })
+                      <div style={{ marginBottom: '.5em' }}>
+                        <Header as="h5" style={{ marginBottom: 0 }}>
+                          Service {index + 1}
+                        </Header>
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ wordBreak: 'break-word' }}>
+                          <strong>Name:</strong> {ownerDid}#{serviceName}
+                        </div>
+                        <div style={{ wordBreak: 'break-word' }}>
+                          <strong>Type:</strong> {serviceTypeText || '—'}
+                        </div>
+                        <div style={{ wordBreak: 'break-word' }}>
+                          <strong>Endpoint:</strong> {endpointText || '—'}
+                        </div>
+                      </div>
+                      <div style={{ textAlign: 'right', marginTop: 'auto' }}>
+                        <Button
+                          negative
+                          type="button"
+                          onClick={() => submitRemoveServiceValue(serviceIdHex)}
+                          loading={isUpdatingDid}
+                          disabled={isUpdatingDid}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    </Segment>
+                  )
+                })}
+              </div>
             )}
             <Header as="h4" style={{ marginTop: '1.5em' }}>
-              Add new service
+              Add New Service
             </Header>
             <Form>
-              <Form.Field>
-                <label>Name</label>
-                <Input
-                  fluid
-                  placeholder="service-name"
-                  value={serviceIdInput}
-                  onChange={(_, changed) => {
-                    setServiceIdInput(changed.value)
-                    clearDidUpdateMessages()
-                  }}
-                />
-              </Form.Field>
-              <Form.Field>
-                <label>Service type</label>
-                <Input
-                  fluid
-                  placeholder="type"
-                  value={serviceTypeInput}
-                  onChange={(_, changed) => {
-                    setServiceTypeInput(changed.value)
-                    clearDidUpdateMessages()
-                  }}
-                />
-              </Form.Field>
-              <Form.Field>
-                <label>Endpoint</label>
-                <Input
-                  fluid
-                  placeholder="https://..."
-                  value={serviceEndpointInput}
-                  onChange={(_, changed) => {
-                    setServiceEndpointInput(changed.value)
-                    clearDidUpdateMessages()
-                  }}
-                />
-              </Form.Field>
+              <Form.Group widths="equal">
+                <Form.Field>
+                  <Input
+                    fluid
+                    placeholder="Name"
+                    value={serviceIdInput}
+                    onChange={(_, changed) => {
+                      setServiceIdInput(changed.value)
+                      clearDidUpdateMessages()
+                    }}
+                  />
+                </Form.Field>
+                <Form.Field>
+                  <Input
+                    fluid
+                    placeholder="Type"
+                    value={serviceTypeInput}
+                    onChange={(_, changed) => {
+                      setServiceTypeInput(changed.value)
+                      clearDidUpdateMessages()
+                    }}
+                  />
+                </Form.Field>
+                <Form.Field>
+                  <Input
+                    fluid
+                    placeholder="Endpoint"
+                    value={serviceEndpointInput}
+                    onChange={(_, changed) => {
+                      setServiceEndpointInput(changed.value)
+                      clearDidUpdateMessages()
+                    }}
+                  />
+                </Form.Field>
+              </Form.Group>
               <Button
                 primary
                 type="button"
@@ -1322,78 +1464,118 @@ export default function DidDataStorage() {
         )}
         {didUpdateSection === 'Metadata' && (
           <Segment>
-            <Header as="h4">Existing metadata</Header>
+            <Header as="h4">Existing Metadata</Header>
             {metadata.length === 0 ? (
               <Message size="small" info content="No metadata found for this DID." />
             ) : (
-              metadata.map((entry, index) => {
-                const keyHex = formatBytesHex(entry.key)
-                const keyText = formatBytesText(entry.key)
-                const valueText = formatBytesText(entry.value)
+              <div
+                style={{
+                  display: 'grid',
+                  gap: '1em',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+                  alignItems: 'stretch',
+                  gridAutoRows: '1fr',
+                }}
+              >
+                {metadata.map((entry, index) => {
+                  const keyHex = formatBytesHex(entry.key)
+                  const keyText = formatBytesText(entry.key)
+                  const valueText = formatBytesText(entry.value)
 
-                return (
-                  <Segment key={`${keyHex}-${index}`}>
-                    <Header as="h5">Entry {index + 1}</Header>
-                    <div style={{ wordBreak: 'break-word' }}>
-                      <strong>Key:</strong> {keyText || keyHex || '—'}
-                    </div>
-                    <div style={{ wordBreak: 'break-word' }}>
-                      <strong>Value:</strong> {valueText || '—'}
-                    </div>
-                    <Button
-                      type="button"
-                      onClick={() => {
-                        setMetadataKeyInput(keyText || keyHex)
-                        setMetadataValueInput(valueText)
-                        clearDidUpdateMessages()
+                  return (
+                    <Segment
+                      key={`${keyHex}-${index}`}
+                      style={{
+                        boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        height: '100%',
+                        minHeight: '180px',
+                        margin: 0,
                       }}
-                      disabled={isUpdatingDid}
-                      style={{ marginTop: '.5em' }}
                     >
-                      Update
-                    </Button>
-                    <Button
-                      negative
-                      type="button"
-                      onClick={() => submitRemoveMetadataValue(keyHex)}
-                      loading={isUpdatingDid}
-                      disabled={isUpdatingDid}
-                      style={{ marginTop: '.5em' }}
-                    >
-                      Remove
-                    </Button>
-                  </Segment>
-                )
-              })
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          marginBottom: '.5em',
+                        }}
+                      >
+                        <Header as="h5" style={{ marginBottom: 0 }}>
+                          Entry {index + 1}
+                        </Header>
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ wordBreak: 'break-word' }}>
+                          <strong>Key:</strong> {keyText || keyHex || '—'}
+                        </div>
+                        <div style={{ wordBreak: 'break-word' }}>
+                          <strong>Value:</strong> {valueText || '—'}
+                        </div>
+                      </div>
+                      <div
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'flex-end',
+                          gap: '.5em',
+                          marginTop: 'auto',
+                        }}
+                      >
+                        <Button
+                          type="button"
+                          onClick={() => {
+                            setMetadataKeyInput(keyText || keyHex)
+                            setMetadataValueInput(valueText)
+                            clearDidUpdateMessages()
+                          }}
+                          disabled={isUpdatingDid}
+                        >
+                          Update
+                        </Button>
+                        <Button
+                          negative
+                          type="button"
+                          onClick={() => submitRemoveMetadataValue(keyHex)}
+                          loading={isUpdatingDid}
+                          disabled={isUpdatingDid}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    </Segment>
+                  )
+                })}
+              </div>
             )}
             <Header as="h4" style={{ marginTop: '1.5em' }}>
-              Add new metadata
+              Add New Metadata
             </Header>
             <Form>
-              <Form.Field>
-                <label>Metadata key</label>
-                <Input
-                  fluid
-                  placeholder="key"
-                  value={metadataKeyInput}
-                  onChange={(_, changed) => {
-                    setMetadataKeyInput(changed.value)
-                    clearDidUpdateMessages()
-                  }}
-                />
-              </Form.Field>
-              <Form.Field>
-                <label>Metadata value</label>
-                <Input
-                  fluid
-                  placeholder="value"
-                  value={metadataValueInput}
-                  onChange={(_, changed) => {
-                    setMetadataValueInput(changed.value)
-                    clearDidUpdateMessages()
-                  }}
-                />
-              </Form.Field>
+              <Form.Group widths="equal">
+                <Form.Field>
+                  <Input
+                    fluid
+                    placeholder="Key"
+                    value={metadataKeyInput}
+                    onChange={(_, changed) => {
+                      setMetadataKeyInput(changed.value)
+                      clearDidUpdateMessages()
+                    }}
+                  />
+                </Form.Field>
+                <Form.Field>
+                  <Input
+                    fluid
+                    placeholder="Value"
+                    value={metadataValueInput}
+                    onChange={(_, changed) => {
+                      setMetadataValueInput(changed.value)
+                      clearDidUpdateMessages()
+                    }}
+                  />
+                </Form.Field>
+              </Form.Group>
               <Button
                 primary
                 type="button"
@@ -1402,62 +1584,6 @@ export default function DidDataStorage() {
                 disabled={isUpdatingDid}
               >
                 Set metadata
-              </Button>
-            </Form>
-          </Segment>
-        )}
-        {didUpdateSection === 'Rotate key' && (
-          <Segment>
-            <Header as="h4">Rotate key</Header>
-            <Form>
-              <Form.Field>
-                <label>Old public key</label>
-                <Input
-                  fluid
-                  placeholder="0x... or text"
-                  value={rotateOldPublicKey}
-                  onChange={(_, changed) => {
-                    setRotateOldPublicKey(changed.value)
-                    clearDidUpdateMessages()
-                  }}
-                />
-              </Form.Field>
-              <Form.Field>
-                <label>New public key</label>
-                <Input
-                  fluid
-                  placeholder="0x... or text"
-                  value={rotateNewPublicKey}
-                  onChange={(_, changed) => {
-                    setRotateNewPublicKey(changed.value)
-                    clearDidUpdateMessages()
-                  }}
-                />
-              </Form.Field>
-              <Form.Field>
-                <label>Roles for new key</label>
-                <Dropdown
-                  fluid
-                  multiple
-                  selection
-                  search
-                  options={ROLE_OPTIONS}
-                  placeholder="Select roles"
-                  value={rotateKeyRoles}
-                  onChange={(_, changed) => {
-                    setRotateKeyRoles(changed.value)
-                    clearDidUpdateMessages()
-                  }}
-                />
-              </Form.Field>
-              <Button
-                primary
-                type="button"
-                onClick={submitRotateKey}
-                loading={isUpdatingDid}
-                disabled={isUpdatingDid}
-              >
-                Rotate key
               </Button>
             </Form>
           </Segment>
@@ -1476,52 +1602,170 @@ export default function DidDataStorage() {
             </Button>
           </Segment>
         )}
-        {didUpdateError && (
-          <Message
-            negative
-            size="small"
-            style={{ marginTop: '.5em' }}
-            content={didUpdateError}
-          />
-        )}
-        {didUpdateStatus && (
-          <Message
-            info
-            size="small"
-            style={{ marginTop: didUpdateError ? '.5em' : '.75em' }}
-            content={didUpdateStatus}
-          />
-        )}
       </Card.Content>
       </Card>
     )
   }
+
+  const renderSchemaCard = () => (
+    <Card fluid style={{ marginTop: '1.5em' }}>
+      <Card.Content>
+        <Card.Header>Schema</Card.Header>
+        <Card.Meta>Create a credential schema for a DID.</Card.Meta>
+      </Card.Content>
+      <Card.Content>
+        <Form>
+          <Form.Field>
+            <label>Target DID</label>
+            <Dropdown
+              fluid
+              selection
+              search
+              allowAdditions
+              placeholder="DID"
+              options={didOptions}
+              loading={isLoadingDids}
+              value={schemaDidInput}
+              onAddItem={(_, { value }) => {
+                const newValue = String(value || '').trim()
+                if (!newValue) {
+                  return
+                }
+                setDidOptions(prev => {
+                  if (prev.some(option => option.value === newValue)) {
+                    return prev
+                  }
+                  return [
+                    ...prev,
+                    { key: newValue, value: newValue, text: newValue },
+                  ]
+                })
+              }}
+              onChange={(_, changed) => {
+                setSchemaDidInput(changed.value)
+                setSchemaJsonError('')
+                setSchemaIdValue('')
+              }}
+            />
+          </Form.Field>
+          <Form.Field>
+            <label>Schema URL</label>
+            <Input
+              placeholder="https://example.com/schema.json"
+              value={schemaUrlInput}
+              onChange={(_, changed) => {
+                setSchemaUrlInput(changed.value)
+                setSchemaIdValue('')
+              }}
+            />
+          </Form.Field>
+          <Form.Field error={Boolean(schemaJsonError)}>
+            <label>Credential schema (JSON)</label>
+            <Form.TextArea
+              placeholder='{"$schema":"https://json-schema.org/draft/2020-12/schema"}'
+              rows={8}
+              value={schemaJsonInput}
+              onChange={(_, changed) => {
+                setSchemaJsonInput(changed.value)
+                if (schemaJsonError) {
+                  setSchemaJsonError('')
+                }
+                setSchemaIdValue('')
+              }}
+            />
+            {schemaJsonError && (
+              <div style={{ color: '#a94442', marginTop: '6px' }}>
+                {schemaJsonError}
+              </div>
+            )}
+          </Form.Field>
+          <Form.Field>
+            <label>Schema ID</label>
+            <Input
+              fluid
+              readOnly
+              placeholder="Schema ID will appear after validation"
+              value={schemaIdValue}
+            />
+          </Form.Field>
+          <Button
+            primary
+            type="button"
+            onClick={submitCreateSchema}
+            loading={isCreatingSchema}
+            disabled={isCreatingSchema}
+          >
+            Create schema
+          </Button>
+        </Form>
+      </Card.Content>
+    </Card>
+  )
 
   const renderFeatureContent = () => {
     if (activeFeature === 'DID details') {
       return renderDidDetailsCard()
     }
 
-    if (activeFeature === 'Create DID') {
-      return renderCreateDidCard()
-    }
-
     if (activeFeature === 'DID update') {
       return renderDidUpdateCard()
     }
 
-    return (
-      <Segment placeholder style={{ marginTop: '1.5em', textAlign: 'center' }}>
-        <Header icon>
-          <Icon name="sitemap" />
-          Schema management will be available in this tab.
-        </Header>
-      </Segment>
-    )
+    return renderSchemaCard()
   }
 
   return (
     <Grid.Column width={16}>
+      <div
+        style={{
+          position: 'fixed',
+          top: '16px',
+          right: '16px',
+          zIndex: 1000,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px',
+          maxWidth: '520px',
+          width: '420px',
+        }}
+      >
+        {toasts.map(toast => (
+          <div
+            key={toast.id}
+            style={{
+              background: toast.type === 'error' ? '#8f1d1d' : '#0b8a82',
+              color: '#fff',
+              borderRadius: '6px',
+              padding: '10px 12px',
+              boxShadow: '0 8px 16px rgba(0,0,0,0.15)',
+              fontSize: '0.95em',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '8px',
+              textAlign: 'center',
+            }}
+          >
+            <span style={{ flex: 1, textAlign: 'center', whiteSpace: 'normal' }}>
+              {toast.content}
+            </span>
+            <button
+              type="button"
+              onClick={() => setToasts(prev => prev.filter(item => item.id !== toast.id))}
+              style={{
+                border: 'none',
+                background: 'transparent',
+                color: '#fff',
+                cursor: 'pointer',
+                fontSize: '1em',
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
       <Header as="h2" dividing style={{ marginBottom: '0.75em' }}>
         <Icon name="cogs" color="grey" />
         <Header.Content>DID Control Center</Header.Content>

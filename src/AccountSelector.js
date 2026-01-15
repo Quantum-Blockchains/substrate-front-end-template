@@ -9,7 +9,14 @@ import {
   Icon,
   Image,
   Label,
+  Input,
+  Message,
+  Modal,
 } from 'semantic-ui-react'
+
+import { Keyring } from '@polkadot/keyring'
+import { cryptoWaitReady } from '@polkadot/util-crypto'
+import { BN } from '@polkadot/util'
 
 import { useSubstrate, useSubstrateState } from './substrate-lib'
 
@@ -20,6 +27,11 @@ function Main(props) {
     setCurrentAccount,
     state: { keyring, currentAccount },
   } = useSubstrate()
+  const { api } = useSubstrateState()
+  const [receiveOpen, setReceiveOpen] = useState(false)
+  const [receiveAddress, setReceiveAddress] = useState('')
+  const [receiveStatus, setReceiveStatus] = useState('')
+  const [isSendingFunds, setIsSendingFunds] = useState(false)
 
   // Get the list of accounts we possess the private key for
   const keyringOptions = keyring.getPairs().map(account => ({
@@ -42,6 +54,64 @@ function Main(props) {
 
   const onChange = addr => {
     setCurrentAccount(keyring.getPair(addr))
+  }
+
+  const sendFunds = async () => {
+    setReceiveStatus('')
+
+    if (!api) {
+      setReceiveStatus('API is not ready yet.')
+      return
+    }
+
+    if (!receiveAddress.trim()) {
+      setReceiveStatus('Enter an account address.')
+      return
+    }
+
+    setIsSendingFunds(true)
+
+    try {
+      await cryptoWaitReady()
+      const tempKeyring = new Keyring({ type: 'sr25519' })
+      const senderPair = tempKeyring.addFromUri('//Alice')
+
+      const decimals = api.registry.chainDecimals?.[0] ?? 0
+      const base = new BN(10).pow(new BN(decimals))
+      let amount = base.div(new BN(100000))
+      if (amount.isZero()) {
+        amount = new BN(1)
+      }
+
+      await api.tx.balances
+        .transferKeepAlive(receiveAddress.trim(), amount)
+        .signAndSend(senderPair, result => {
+          if (result.dispatchError) {
+            if (result.dispatchError.isModule) {
+              const decoded = api.registry.findMetaError(
+                result.dispatchError.asModule
+              )
+              setReceiveStatus(
+                `Transaction failed: ${decoded.section}.${decoded.name}`
+              )
+            } else {
+              setReceiveStatus(
+                `Transaction failed: ${result.dispatchError.toString()}`
+              )
+            }
+            setIsSendingFunds(false)
+            return
+          }
+
+          if (result.status.isFinalized) {
+            setReceiveStatus('Transfer finalized.')
+            setIsSendingFunds(false)
+          }
+        })
+    } catch (error) {
+      setReceiveStatus(`Failed to send: ${error.message}`)
+      setIsSendingFunds(false)
+    }
   }
 
   return (
@@ -84,8 +154,56 @@ function Main(props) {
             value={acctAddr(currentAccount)}
           />
           <BalanceAnnotation />
+          <Button
+            basic
+            size="small"
+            style={{ marginLeft: '0.75em' }}
+            onClick={() => {
+              setReceiveOpen(true)
+              setReceiveStatus('')
+            }}
+          >
+            Receive funds
+          </Button>
         </Menu.Menu>
       </Container>
+      <Modal
+        open={receiveOpen}
+        onClose={() => setReceiveOpen(false)}
+        size="small"
+      >
+        <Modal.Header>Receive funds</Modal.Header>
+        <Modal.Content>
+          <div style={{ marginBottom: '0.75em' }}>Account address</div>
+          <Input
+            fluid
+            placeholder="Enter account address"
+            value={receiveAddress}
+            onChange={(_, data) => {
+              setReceiveAddress(data.value)
+              setReceiveStatus('')
+            }}
+          />
+          {receiveStatus && (
+            <Message
+              info
+              size="small"
+              style={{ marginTop: '0.75em' }}
+              content={receiveStatus}
+            />
+          )}
+        </Modal.Content>
+        <Modal.Actions>
+          <Button
+            primary
+            loading={isSendingFunds}
+            disabled={isSendingFunds}
+            onClick={sendFunds}
+          >
+            Receive
+          </Button>
+        </Modal.Actions>
+      </Modal>
     </Menu>
   )
 }
