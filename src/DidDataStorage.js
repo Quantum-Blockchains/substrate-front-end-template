@@ -115,6 +115,14 @@ const buildDidDocument = (didValue, chainData) => {
 }
 
 const FEATURE_TABS = ['DID details', 'DID update', 'Schema']
+const DID_ADD_KEY_PREFIX = 'QSB_DID_ADD_KEY'
+const DID_REVOKE_KEY_PREFIX = 'QSB_DID_REVOKE_KEY'
+const DID_DEACTIVATE_PREFIX = 'QSB_DID_DEACTIVATE'
+const DID_ADD_SERVICE_PREFIX = 'QSB_DID_ADD_SERVICE'
+const DID_REMOVE_SERVICE_PREFIX = 'QSB_DID_REMOVE_SERVICE'
+const DID_SET_METADATA_PREFIX = 'QSB_DID_SET_METADATA'
+const DID_REMOVE_METADATA_PREFIX = 'QSB_DID_REMOVE_METADATA'
+const DID_UPDATE_ROLES_PREFIX = 'QSB_DID_UPDATE_ROLES'
 const ROLE_OPTIONS = [
   { key: 'Authentication', text: 'Authentication', value: 'Authentication' },
   {
@@ -667,6 +675,100 @@ export default function DidDataStorage() {
     await extension.dids.sign({ did, payload })
   }
 
+  const normalizeDidSignature = rawSignature => {
+    if (!rawSignature) {
+      return null
+    }
+
+    if (typeof rawSignature === 'string') {
+      if (isHex(rawSignature)) {
+        return rawSignature
+      }
+      const base64Pattern = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+      if (base64Pattern.test(rawSignature)) {
+        try {
+          const decoded = atob(rawSignature)
+          const bytes = Uint8Array.from(decoded, char => char.charCodeAt(0))
+          return u8aToHex(bytes)
+        } catch (error) {
+          return stringToHex(rawSignature)
+        }
+      }
+      return stringToHex(rawSignature)
+    }
+
+    if (rawSignature instanceof Uint8Array) {
+      return u8aToHex(rawSignature)
+    }
+
+    if (Array.isArray(rawSignature)) {
+      return u8aToHex(Uint8Array.from(rawSignature))
+    }
+
+    if (typeof rawSignature === 'object') {
+      if (typeof rawSignature.toHex === 'function') {
+        return rawSignature.toHex()
+      }
+
+      const candidate =
+        rawSignature.signature ??
+        rawSignature.signatureHex ??
+        rawSignature.didSignature ??
+        rawSignature.signed ??
+        rawSignature.result?.signature ??
+        null
+
+      return normalizeDidSignature(candidate)
+    }
+
+    return null
+  }
+
+  const requestDidSignature = async (did, payloadBytes) => {
+    const extensions = await web3Enable(config.APP_NAME)
+    const extension = extensions.find(item => item?.dids?.sign)
+
+    if (!extension?.dids?.sign) {
+      throw new Error('Extension does not support DID signing.')
+    }
+
+    const payloadHex = u8aToHex(payloadBytes)
+    const signRequest = {
+      did,
+      payload: payloadHex,
+    }
+    const rawSignature = await extension.dids.sign(signRequest)
+    const didSignature = normalizeDidSignature(rawSignature)
+
+    if (!didSignature) {
+      throw new Error('Extension returned an invalid DID signature.')
+    }
+
+    return didSignature
+  }
+
+  const buildSetMetadataDidPayload = (didValue, entry) => {
+    // Build payload from call argument codecs to mirror pallet verification exactly:
+    // prefix || did_id.encode() || entry.encode()
+    const call = api.tx.did.setMetadata(didValue, entry, '0x')
+    const didIdEncoded = call.method.args[0].toU8a()
+    const entryEncoded = call.method.args[1].toU8a()
+    const prefix = stringToU8a(DID_SET_METADATA_PREFIX)
+    const payload = u8aConcat(prefix, didIdEncoded, entryEncoded)
+
+    return payload
+  }
+
+  const buildDidPayload = (prefixValue, call) => {
+    // Payload expected by pallet: prefix || all call args except did_signature
+    const prefix = stringToU8a(prefixValue)
+    const encodedArgs = call.method.args
+      .slice(0, Math.max(0, call.method.args.length - 1))
+      .map(arg => arg.toU8a())
+
+    return u8aConcat(prefix, ...encodedArgs)
+  }
+
   const wrapSignerWithDid = (signer, did) => {
     if (!did || !signer?.signPayload) {
       return signer
@@ -930,10 +1032,16 @@ export default function DidDataStorage() {
       return
     }
 
+    const payload = buildDidPayload(
+      DID_ADD_KEY_PREFIX,
+      api.tx.did.addKey(didValue, publicKey, addKeyRoles, '0x')
+    )
+    const didSignature = await requestDidSignature(didValue, payload)
+
     await submitTx(
-      api.tx.did.addKey(didValue, publicKey, addKeyRoles),
+      api.tx.did.addKey(didValue, publicKey, addKeyRoles, didSignature),
       'Adding key...',
-      didValue
+      null
     )
   }
 
@@ -953,10 +1061,16 @@ export default function DidDataStorage() {
       return
     }
 
+    const payload = buildDidPayload(
+      DID_REVOKE_KEY_PREFIX,
+      api.tx.did.revokeKey(didValue, publicKey, '0x')
+    )
+    const didSignature = await requestDidSignature(didValue, payload)
+
     await submitTx(
-      api.tx.did.revokeKey(didValue, publicKey),
+      api.tx.did.revokeKey(didValue, publicKey, didSignature),
       'Revoking key...',
-      didValue
+      null
     )
   }
 
@@ -970,10 +1084,16 @@ export default function DidDataStorage() {
       return
     }
 
+    const payload = buildDidPayload(
+      DID_DEACTIVATE_PREFIX,
+      api.tx.did.deactivateDid(didValue, '0x')
+    )
+    const didSignature = await requestDidSignature(didValue, payload)
+
     await submitTx(
-      api.tx.did.deactivateDid(didValue),
+      api.tx.did.deactivateDid(didValue, didSignature),
       'Deactivating DID...',
-      didValue
+      null
     )
   }
 
@@ -1011,10 +1131,16 @@ export default function DidDataStorage() {
       endpoint,
     }
 
+    const payload = buildDidPayload(
+      DID_ADD_SERVICE_PREFIX,
+      api.tx.did.addService(didValue, service, '0x')
+    )
+    const didSignature = await requestDidSignature(didValue, payload)
+
     await submitTx(
-      api.tx.did.addService(didValue, service),
+      api.tx.did.addService(didValue, service, didSignature),
       'Adding service...',
-      didValue
+      null
     )
   }
 
@@ -1034,10 +1160,16 @@ export default function DidDataStorage() {
       return
     }
 
+    const payload = buildDidPayload(
+      DID_REMOVE_SERVICE_PREFIX,
+      api.tx.did.removeService(didValue, serviceId, '0x')
+    )
+    const didSignature = await requestDidSignature(didValue, payload)
+
     await submitTx(
-      api.tx.did.removeService(didValue, serviceId),
+      api.tx.did.removeService(didValue, serviceId, didSignature),
       'Removing service...',
-      didValue
+      null
     )
   }
 
@@ -1068,10 +1200,12 @@ export default function DidDataStorage() {
       value,
     }
 
+    const payload = buildSetMetadataDidPayload(didValue, entry)
+    const didSignature = await requestDidSignature(didValue, payload)
     await submitTx(
-      api.tx.did.setMetadata(didValue, entry),
+      api.tx.did.setMetadata(didValue, entry, didSignature),
       'Setting metadata...',
-      didValue
+      null
     )
   }
 
@@ -1091,10 +1225,16 @@ export default function DidDataStorage() {
       return
     }
 
+    const payload = buildDidPayload(
+      DID_REMOVE_METADATA_PREFIX,
+      api.tx.did.removeMetadata(didValue, key, '0x')
+    )
+    const didSignature = await requestDidSignature(didValue, payload)
+
     await submitTx(
-      api.tx.did.removeMetadata(didValue, key),
+      api.tx.did.removeMetadata(didValue, key, didSignature),
       'Removing metadata...',
-      didValue
+      null
     )
   }
 
@@ -1119,14 +1259,21 @@ export default function DidDataStorage() {
       return
     }
 
+    const payload = buildDidPayload(
+      DID_UPDATE_ROLES_PREFIX,
+      api.tx.did.updateRoles(didValue, publicKey, updateRolesValues, '0x')
+    )
+    const didSignature = await requestDidSignature(didValue, payload)
+
     await submitTx(
       api.tx.did.updateRoles(
         didValue,
         publicKey,
-        updateRolesValues
+        updateRolesValues,
+        didSignature
       ),
       'Updating roles...',
-      didValue
+      null
     )
   }
 
